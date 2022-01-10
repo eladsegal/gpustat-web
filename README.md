@@ -20,7 +20,7 @@ It is known that asyncssh [does NOT obey](https://github.com/ronf/asyncssh/issue
 (e.g. alias, username, keyfile), so just be aware of this.
 
 ```
-python -m gpustat_web --port 48109 HOST1 [... HOSTN]
+python -m gpustat_web WS_URL --port 48109 HOST1 [... HOSTN]
 ```
 
 Python 3.6+ is required.

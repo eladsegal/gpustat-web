@@ -47,101 +47,6 @@ class Context(object):
 
 context = Context()
 
-
-async def run_client(hostname: str, exec_cmd: str, *, port=22,
-                     poll_delay=None, timeout=30.0,
-                     name_length=None, verbose=False):
-    '''An async handler to collect gpustat through a SSH channel.'''
-    L = name_length or 0
-    if poll_delay is None:
-        poll_delay = context.interval
-
-    async def _loop_body():
-        # establish a SSH connection.
-        async with asyncssh.connect(hostname, port=port) as conn:
-            cprint(f"[{hostname:<{L}}] SSH connection established!", attrs=['bold'])
-
-            while True:
-                if False: #verbose: XXX DEBUG
-                    print(f"[{hostname:<{L}}] querying... ")
-
-                result = await asyncio.wait_for(conn.run(exec_cmd), timeout=timeout)
-
-                now = datetime.now().strftime('%Y/%m/%d-%H:%M:%S.%f')
-                if result.exit_status != 0:
-                    cprint(f"[{now} [{hostname:<{L}}] Error, exitcode={result.exit_status}", color='red')
-                    cprint(result.stderr or '', color='red')
-                    stderr_summary = (result.stderr or '').split('\n')[0]
-                    context.host_set_message(hostname, colored(f'[exitcode {result.exit_status}] {stderr_summary}', 'red'))
-                else:
-                    if verbose:
-                        cprint(f"[{now} [{hostname:<{L}}] OK from gpustat ({len(result.stdout)} bytes)", color='cyan')
-                    # update data
-                    context.host_status[hostname] = result.stdout
-
-                # wait for a while...
-                await asyncio.sleep(poll_delay)
-
-    while True:
-        try:
-            # start SSH connection, or reconnect if it was disconnected
-            await _loop_body()
-
-        except asyncio.CancelledError:
-            cprint(f"[{hostname:<{L}}] Closed as being cancelled.", attrs=['bold'])
-            break
-        except (asyncio.TimeoutError) as ex:
-            # timeout (retry)
-            cprint(f"Timeout after {timeout} sec: {hostname}", color='red')
-            context.host_set_message(hostname, colored(f"Timeout after {timeout} sec", 'red'))
-        except (asyncssh.misc.DisconnectError, asyncssh.misc.ChannelOpenError, OSError) as ex:
-            # error or disconnected (retry)
-            cprint(f"Disconnected : {hostname}, {str(ex)}", color='red')
-            context.host_set_message(hostname, colored(str(ex), 'red'))
-        except Exception as e:
-            # A general exception unhandled, throw
-            cprint(f"[{hostname:<{L}}] {e}", color='red')
-            context.host_set_message(hostname, colored(f"{type(e).__name__}: {e}", 'red'))
-            cprint(traceback.format_exc())
-            raise
-
-        # retry upon timeout/disconnected, etc.
-        cprint(f"[{hostname:<{L}}] Disconnected, retrying in {poll_delay} sec...", color='yellow')
-        await asyncio.sleep(poll_delay)
-
-
-async def spawn_clients(hosts: List[str], exec_cmd: str, *,
-                        default_port: int, verbose=False):
-    '''Create a set of async handlers, one per host.'''
-
-    def _parse_host_string(netloc: str) -> Tuple[str, Optional[int]]:
-        """Parse a connection string (netloc) in the form of `HOSTNAME[:PORT]`
-        and returns (HOSTNAME, PORT)."""
-        pr = urllib.parse.urlparse('ssh://{}/'.format(netloc))
-        assert pr.hostname is not None, netloc
-        return (pr.hostname, pr.port)
-
-    try:
-        host_names, host_ports = zip(*(_parse_host_string(host) for host in hosts))
-
-        # initial response
-        for hostname in host_names:
-            context.host_set_message(hostname, "Loading ...")
-
-        name_length = max(len(hostname) for hostname in host_names)
-
-        # launch all clients parallel
-        await asyncio.gather(*[
-            run_client(hostname, exec_cmd, port=port or default_port,
-                    verbose=verbose, name_length=name_length)
-            for (hostname, port) in zip(host_names, host_ports)
-        ])
-    except Exception as ex:
-        # TODO: throw the exception outside and let aiohttp abort startup
-        traceback.print_exc()
-        cprint(colored("Error: An exception occured during the startup.", 'red'))
-
-
 ###############################################################################
 # webserver handlers.
 ###############################################################################
@@ -168,7 +73,7 @@ async def handler(request):
 
     data = dict(
         ansi2html_headers=ansi_conv.produce_headers().replace('\n', ' '),
-        http_host=request.host,
+        http_host=WS_URL,
         interval=int(context.interval * 1000)
     )
     response = aiojinja2.render_template('index.html', request, data)
@@ -176,60 +81,19 @@ async def handler(request):
     return response
 
 
-async def websocket_handler(request):
-    print("INFO: Websocket connection from {} established".format(request.remote))
-
-    ws = web.WebSocketResponse()
-    await ws.prepare(request)
-
-    async def _handle_websocketmessage(msg):
-        if msg.data == 'close':
-            await ws.close()
-        else:
-            # send the rendered HTML body as a websocket message.
-            body = render_gpustat_body()
-            await ws.send_str(body)
-
-    async for msg in ws:
-        if msg.type == aiohttp.WSMsgType.CLOSE:
-            break
-        elif msg.type == aiohttp.WSMsgType.TEXT:
-            await _handle_websocketmessage(msg)
-        elif msg.type == aiohttp.WSMsgType.ERROR:
-            cprint("Websocket connection closed with exception %s" % ws.exception(), color='red')
-
-    print("INFO: Websocket connection from {} closed".format(request.remote))
-    return ws
-
 ###############################################################################
 # app factory and entrypoint.
 ###############################################################################
 
-def create_app(loop, *,
-               hosts=['localhost'],
-               default_port: int = 22,
+def create_app(*,
                ssl_certfile: Optional[str] = None,
                ssl_keyfile: Optional[str] = None,
-               exec_cmd: Optional[str] = None,
-               verbose=True):
+               exec_cmd: Optional[str] = None):
     if not exec_cmd:
         exec_cmd = DEFAULT_GPUSTAT_COMMAND
 
     app = web.Application()
     app.router.add_get('/', handler)
-    app.add_routes([web.get('/ws', websocket_handler)])
-
-    async def start_background_tasks(app):
-        clients = spawn_clients(
-            hosts, exec_cmd, default_port=default_port, verbose=verbose)
-        app['tasks'] = loop.create_task(clients)
-        await asyncio.sleep(0.1)
-    app.on_startup.append(start_background_tasks)
-
-    async def shutdown_background_tasks(app):
-        cprint(f"... Terminating the application", color='yellow')
-        app['tasks'].cancel()
-    app.on_shutdown.append(shutdown_background_tasks)
 
     # jinja2 setup
     import jinja2
@@ -250,16 +114,13 @@ def create_app(loop, *,
     return app, ssl_context
 
 
+WS_URL = ""
 def main():
     import argparse
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('hosts', nargs='*',
-                        help='List of nodes. Syntax: HOSTNAME[:PORT]')
-    parser.add_argument('--verbose', action='store_true')
+    parser.add_argument("ws", type=str, help="The URL of the WebSocket to use.")
     parser.add_argument('--port', type=int, default=48109,
                         help="Port number the web application will listen to. (Default: 48109)")
-    parser.add_argument('--ssh-port', type=int, default=22,
-                        help="Default SSH port to establish connection through. (Default: 22)")
     parser.add_argument('--interval', type=float, default=5.0,
                         help="Interval (in seconds) between two consecutive requests.")
     parser.add_argument('--ssl-certfile', type=str, default=None,
@@ -271,19 +132,17 @@ def main():
                         help="command-line to execute (e.g. gpustat --color --gpuname-width 25)")
     args = parser.parse_args()
 
-    hosts = args.hosts or ['localhost']
-    cprint(f"Hosts : {hosts}", color='green')
+    global WS_URL
+    WS_URL = args.ws
+
     cprint(f"Cmd   : {args.exec}", color='yellow')
 
     if args.interval > 0.1:
         context.interval = args.interval
 
-    loop = asyncio.get_event_loop()
     app, ssl_context = create_app(
-        loop, hosts=hosts, default_port=args.ssh_port,
         ssl_certfile=args.ssl_certfile, ssl_keyfile=args.ssl_keyfile,
-        exec_cmd=args.exec,
-        verbose=args.verbose)
+        exec_cmd=args.exec)
 
     web.run_app(app, host='0.0.0.0', port=args.port,
                 ssl_context=ssl_context)

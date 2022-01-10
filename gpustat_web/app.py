@@ -7,19 +7,11 @@ MIT License
 Copyright (c) 2018-2020 Jongwook Choi (@wookayin)
 """
 
-from typing import List, Tuple, Optional
+from typing import Optional
 import os
-import sys
-import traceback
-import urllib
 import ssl
 
-import asyncio
-import asyncssh
-import aiohttp
-
-from datetime import datetime
-from collections import OrderedDict, Counter
+from collections import OrderedDict
 
 from termcolor import cprint, colored
 from aiohttp import web

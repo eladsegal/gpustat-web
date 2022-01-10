@@ -1,6 +1,5 @@
 from distutils.version import LooseVersion
 import sys
-import asyncssh
 
 
 if sys.version_info < (3, 6):
